@@ -45,7 +45,8 @@ em `token_budget.py`; pedidos ambíguos usam o registro completo.
   conserva trechos, não é uma síntese semântica e pode perder detalhes antigos.
   Os resultados brutos das ferramentas e as imagens não voltam nos próximos
   turnos. O histórico em RAM termina ao fechar o Janus.
-- Voz: lê a primeira frase da resposta, limitada a 200 caracteres, sem consultar
+- Voz: pede ao modelo uma primeira frase com o resultado principal e descarta
+  localmente aberturas genéricas conhecidas. Lê a frase, limitada a 200 caracteres, sem consultar
   o Gemini outra vez. A resposta completa continua aparecendo no console.
 - Ferramentas: seleção por termos do pedido e, em continuações curtas, do pedido
   anterior. Se não houver correspondência, todas ficam disponíveis. Saídas têm
@@ -62,6 +63,10 @@ em `token_budget.py`; pedidos ambíguos usam o registro completo.
   Perguntas com menos de três palavras não fazem busca vetorial automática.
   Novos registros usam até 1.500 caracteres da pergunta e da resposta; registros
   anteriores não são alterados. O modelo de embeddings continua o mesmo.
+  Pedidos de clima e continuações reconhecidas como “E amanhã?” dispensam
+  busca e gravação vetorial, inclusive os embeddings dessas operações. A conversa
+  permanece no histórico temporário da sessão. Pedidos explícitos para lembrar
+  ou salvar algo preservam o fluxo de memória. Registros antigos não são apagados.
 - Tela: somente pedidos explícitos como “olhe a tela” ou “print da tela”
   capturam o monitor principal, com dimensão máxima de 1280 pixels por lado.
 - Geração: teto padrão de 2.048 tokens de saída por chamada e oito respostas
@@ -77,7 +82,11 @@ O log `[Tokens]` soma os metadados das respostas recebidas do Gemini, incluindo
 as chamadas intermediárias de ferramentas e respostas de modelos de contingência.
 Mostra entrada, saída, raciocínio, cache e total informado pela API. Cache e
 raciocínio não devem ser somados novamente ao total. Campos ausentes do SDK
-ficam em zero; respostas sem metadados são contadas separadamente.
+ficam identificados em `campos_ausentes`; raciocínio e cache totalmente indisponíveis
+aparecem como `None`, sem serem confundidos com zero. `nao_discriminados` mostra
+a diferença positiva entre total, entrada, saída e raciocínio informado, sem
+atribuir essa diferença a uma categoria presumida. Cache não é subtraído novamente,
+pois faz parte da entrada. Respostas sem metadados são contadas separadamente.
 Embeddings e requisições que falharam sem retornar metadados não estão incluídos.
 Os registros ficam no console, sem salvar o conteúdo dos pedidos em outro arquivo.
 

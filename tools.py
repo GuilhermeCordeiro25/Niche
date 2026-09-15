@@ -1,4 +1,6 @@
 import os
+from janus.permissions import confirmar_acao as _confirmar_acao
+from weather_service import consultar_clima as _consultar_clima
 from token_budget import limite_env
 import webbrowser
 import pygetwindow as gw
@@ -344,26 +346,9 @@ def buscar_solucao_web(pergunta: str) -> str:
         logging.critical(f"Erro crítico na ferramenta de busca web para '{pergunta}': {e}")
         return f"Erro crítico na ferramenta de busca web: {e}"
 
-def verificar_clima(cidade: str) -> str:
-    """
-    Busca a previsão do tempo atual e condições climáticas reais para qualquer cidade.
-    Acione esta ferramenta sempre que o usuário perguntar sobre o clima, temperatura ou se vai chover.
-    """
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    cidade_formatada = urllib.parse.quote(cidade)
-
-    try:
-        url = f"https://pt.wttr.in/{cidade_formatada}?format=%C+|+Temperatura:+%t+|+Sensação:+%f+|+Umidade:+%h"
-        resposta = requests.get(url, timeout=5, verify=False)
-
-        if resposta.status_code == 200:
-            logging.info(f"Dados meteorológicos de {cidade} obtidos com sucesso.")
-            return f"Dados meteorológicos de {cidade}: {resposta.text}"
-        logging.warning(f"Falha ao buscar dados climáticos para {cidade}. Código: {resposta.status_code}")
-        return f"Falha ao buscar dados (Código {resposta.status_code})."
-    except Exception as e:
-        logging.error(f"Erro de conexão ao verificar o clima para {cidade}: {e}")
-        return f"Erro de conexão ao verificar o clima: {e}"
+def verificar_clima(cidade: str, estado: str = '', pais: str = '') -> str:
+    """Consulta clima e previsão de três dias. Use cidade sem estado; estado por extenso e pais ISO de duas letras se conhecidos. Peça esclarecimento se houver ambiguidade."""
+    return _consultar_clima(cidade, estado, pais)
 
 # =================================================================
 # SETOR 5: SEGURANÇA
@@ -586,17 +571,8 @@ def executar_comando_terminal(comando: str) -> str:
     Args:
         comando (str): O comando de terminal a ser executado.
     """
-    # Pausa o loop e pede aprovação no console
-    print("\n" + "!" * 50)
-    print(" ALERTA DE SEGURANÇA: AVALIAÇÃO DE COMANDO ".center(50, " "))
-    print("!" * 50)
-    print(f"O Janus elaborou um plano e deseja rodar o seguinte comando:\n\n>  {comando}\n")
-
-    confirmacao = input("Permitir a execução? (S/N): ").strip().lower()
-
-    if confirmacao != 's':
-        logging.warning("Execução de comando bloqueada pelo usuário.")
-        return "Acesso negado: O usuário cancelou a execução deste comando por motivos de segurança."
+    if not _confirmar_acao("executar_comando_terminal", {"comando": comando}):
+        return "Acesso negado: o usuário cancelou a execução."
 
     logging.info(f"Permissão concedida. Executando comando: {comando}")
 

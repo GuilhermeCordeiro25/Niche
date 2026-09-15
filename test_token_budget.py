@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import unittest
 
 from token_budget import (Contexto, UsoTokens, limitar, limite_env, resumo_voz,
-                          selecionar_ferramentas, limitar_ferramentas, filtrar_memorias)
+                          selecionar_ferramentas, limitar_ferramentas, filtrar_memorias,
+                          consulta_temporaria)
 
 
 def carregar_funcao(nome, arquivo='tools.py', **globais):
@@ -19,6 +20,35 @@ def carregar_funcao(nome, arquivo='tools.py', **globais):
 
 
 class EconomiaTests(unittest.TestCase):
+    def test_clima_dispensa_memoria_inclusive_continuacao(self):
+        self.assertTrue(consulta_temporaria('Qual a previsão de tempo para Camaçari?'))
+        self.assertTrue(consulta_temporaria('E amanhã?', True))
+        self.assertTrue(consulta_temporaria('E em Salvador?', True))
+        self.assertFalse(consulta_temporaria('Abra o Excel', True))
+        self.assertFalse(consulta_temporaria('Qual a temperatura da CPU?', True))
+        self.assertFalse(consulta_temporaria('Lembre que gosto de clima frio', True))
+
+    def test_voz_pula_introducao_sem_remover_falhas(self):
+        texto = 'Aqui estão os dados meteorológicos atuais para Camaçari. Camaçari está com 28,4 °C.'
+        self.assertEqual(resumo_voz(texto), 'Camaçari está com 28,4 °C.')
+        self.assertEqual(resumo_voz('A consulta falhou. Tente novamente.'), 'A consulta falhou.')
+
+    def test_uso_diferenca_nao_e_atribuida_a_raciocinio(self):
+        uso = UsoTokens()
+        uso.registrar(SimpleNamespace(usage_metadata=SimpleNamespace(
+            prompt_token_count=1148, candidates_token_count=261, total_token_count=1758)))
+        self.assertEqual(uso.totais['nao_discriminados'], 349)
+        self.assertIsNone(uso.totais['raciocinio'])
+        self.assertEqual(uso.campos_ausentes['raciocinio'], 1)
+
+    def test_uso_cache_nao_e_somado_duas_vezes(self):
+        uso = UsoTokens()
+        uso.registrar(SimpleNamespace(usage_metadata=dict(prompt_token_count=100,
+            candidates_token_count=20, thoughts_token_count=30,
+            cached_content_token_count=80, total_token_count=150)))
+        self.assertEqual(uso.totais['raciocinio'], 30)
+        self.assertEqual(uso.totais['nao_discriminados'], 0)
+
     def test_historico_limitado_e_pares_completos(self):
         contexto = Contexto(max_pares=2, max_chars=1000, resumo_chars=100)
         for i in range(20):
@@ -106,7 +136,7 @@ class EconomiaTests(unittest.TestCase):
             def __init__(self, **kwargs): pass
             def generate_content(self, *args, **kwargs):
                 return SimpleNamespace(usage_metadata=None)
-        classe = carregar_funcao('ModeloMedido', 'main.py',
+        classe = carregar_funcao('ModeloMedido', 'janus/runtime.py',
                                 genai=SimpleNamespace(GenerativeModel=FakeModel),
                                 limite_env=lambda *a, **k: 2)
         uso = UsoTokens()

@@ -29,10 +29,30 @@ def normalizar(texto):
 def resumo_voz(texto, limite=200):
     texto = re.sub(r'```.*?```', ' Código disponível no texto. ', texto, flags=re.S)
     texto = re.sub(r'\s+', ' ', texto.replace('*', '').replace('#', '')).strip()
-    primeira = re.split(r'(?<=[.!?])\s+', texto)[0]
+    frases = re.split(r'(?<=[.!?])\s+', texto)
+    # Descarta somente aberturas genéricas conhecidas; preserva avisos de falha.
+    while len(frases) > 1 and re.match(
+            r'^(aqui est[aã]o|aqui est[aá]|segue[m]? (?:os|as|o|a) |'
+            r'vou (?:consultar|verificar|buscar) )', frases[0], re.I):
+        frases.pop(0)
+    primeira = frases[0]
     if len(primeira) <= limite:
         return primeira
     return primeira[:limite-1].rsplit(' ', 1)[0] + '…'
+
+
+def consulta_temporaria(pergunta, anterior_temporaria=False):
+    """Clima fica só no histórico da sessão; pedidos de memória explícitos prevalecem."""
+    texto = normalizar(pergunta)
+    if re.search(r'\b(lembre|lembrar|guarde|salve|memorize|memoria|preferencia)\b', texto):
+        return False
+    if re.search(r'\b(cpu|processador|gpu|computador|hardware)\b', texto):
+        return False
+    if re.search(r'\b(clima|meteorolog\w*|chover|chuva|temperatura)\b|previsao (?:do |de )?tempo', texto):
+        return True
+    # Não propaga clima para um pedido novo como "abra o Excel".
+    return bool(anterior_temporaria and re.fullmatch(
+        r'(?:e )?(?:amanha|hoje|depois de amanha|(?:em|para) .{1,80})[?.! ]*', texto))
 
 
 class Contexto:
@@ -121,8 +141,10 @@ def filtrar_memorias(resultados, contexto='', limite=1600, distancia_max=0.8):
 class UsoTokens:
     def __init__(self):
         self.chamadas = 0
-        self.totais = dict(entrada=0, saida=0, raciocinio=0, cache=0, total=0)
+        self.totais = dict(entrada=0, saida=0, raciocinio=None, cache=None, total=0,
+                           nao_discriminados=0)
         self.sem_metadados = 0
+        self.campos_ausentes = {}
 
     def registrar(self, resposta):
         self.chamadas += 1
@@ -133,9 +155,20 @@ class UsoTokens:
         campos = dict(entrada='prompt_token_count', saida='candidates_token_count',
                       raciocinio='thoughts_token_count', cache='cached_content_token_count',
                       total='total_token_count')
+        valores = {}
         for chave, campo in campos.items():
-            self.totais[chave] += getattr(uso, campo, 0) or 0
+            valor = uso.get(campo) if isinstance(uso, dict) else getattr(uso, campo, None)
+            valores[chave] = valor
+            if valor is None:
+                self.campos_ausentes[chave] = self.campos_ausentes.get(chave, 0) + 1
+            else:
+                self.totais[chave] = (self.totais[chave] or 0) + valor
+        if all(valores[k] is not None for k in ('total', 'entrada', 'saida')):
+            # Cache já pertence à entrada. Não atribui diferenças a raciocínio.
+            self.totais['nao_discriminados'] += max(0, valores['total'] - valores['entrada']
+                                                  - valores['saida'] - (valores['raciocinio'] or 0))
 
     def log(self):
-        logging.info('[Tokens] chamadas=%s uso=%s sem_metadados=%s; não inclui embeddings nem requisições sem resposta',
-                     self.chamadas, self.totais, self.sem_metadados)
+        logging.info('[Tokens] chamadas=%s uso=%s sem_metadados=%s campos_ausentes=%s; '
+                     'None=indisponível; não inclui embeddings nem requisições sem resposta',
+                     self.chamadas, self.totais, self.sem_metadados, self.campos_ausentes)
