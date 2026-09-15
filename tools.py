@@ -1,4 +1,5 @@
 import os
+from token_budget import limite_env
 import webbrowser
 import pygetwindow as gw
 import psutil
@@ -11,11 +12,14 @@ import logging
 import requests
 from bs4 import BeautifulSoup
 from googlesearch import search
-import urllib3  
+import urllib3
+import concurrent.futures
+import time
 
+colecao_memoria_global = None
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-DEFAULT_MAX_FILE_READ_CHARS = 150000
-DEFAULT_MAX_WEB_SCRAPE_CHARS_PER_PAGE = 3000
+DEFAULT_MAX_FILE_READ_CHARS = 3000
+DEFAULT_MAX_WEB_SCRAPE_CHARS_PER_PAGE = 1000
 DEFAULT_MAX_FILES_TO_SCAN_SUSPICIOUS = 1500
 
 # =================================================================
@@ -51,8 +55,13 @@ def listar_processos_pesados(quantidade: int = 5) -> str:
     return resultado
 
 def matar_processo(identificador: str) -> str:
-    """Encerra um processo travado ou consumindo muita memória no Windows.
-    Aceita o nome do processo (ex: 'chrome.exe', 'node.exe') ou o número do PID."""
+    """Encerra um processo travado ou consumindo muita memória no Windows."""
+
+    # NOVA LINHA: Proteção anti-rebote para evitar que o processo seja "morto" duas vezes no retry
+    if _anti_rebote(f"kill_{identificador}"):
+        logging.info(f"Comando de matar processo '{identificador}' ignorado pelo anti-rebote.")
+        return f"Ação ignorada: O comando para encerrar '{identificador}' já foi disparado na tentativa anterior."
+
     encerrados = 0
 
     try:
@@ -93,73 +102,78 @@ def abrir_site(url: str) -> str:
     return f"Site {url} aberto com sucesso."
 
 def abrir_pasta(caminho: str) -> str:
-    """Abre uma pasta no Windows Explorer. Ex: 'C:\\Users\\guipe\\Documents'"""
+    """Abre uma pasta no Windows Explorer com tratamento seguro de erros."""
     try:
         os.startfile(caminho)
         logging.info(f"Pasta '{caminho}' aberta.")
-        return f"Pasta '{caminho}' aberta na tela."
-    except Exception as e:
-        logging.error(f"Erro ao tentar abrir a pasta '{caminho}': {str(e)}")
-        return f"Erro ao tentar abrir a pasta: {str(e)}"
+        return f"Pasta aberta na tela com sucesso."
+    except FileNotFoundError:
+        logging.warning(f"Tentativa de abrir pasta inexistente: {caminho}")
+        return "Aviso: A pasta solicitada não foi encontrada no sistema."
+    except PermissionError:
+        logging.warning(f"Acesso negado à pasta: {caminho}")
+        return "Aviso: Não tenho permissão do sistema operacional para abrir esta pasta."
+    except OSError:
+        logging.error(f"Erro de SO ao tentar abrir a pasta: {caminho}")
+        return "Aviso: Caminho inválido ou erro estrutural ao tentar abrir o diretório."
 
 def listar_arquivos_pasta(caminho: str) -> str:
-    """Retorna uma lista com os nomes de todos os arquivos e subpastas dentro de um diretório."""
+    """Retorna o conteúdo de um diretório sem expor rastreios de pilha."""
     try:
         arquivos = os.listdir(caminho)
         if not arquivos:
             logging.info(f"A pasta '{caminho}' está vazia.")
             return "A pasta está vazia."
+
         logging.info(f"Conteúdo da pasta '{caminho}' listado.")
-        return f"Conteúdo de '{caminho}': " + ", ".join(arquivos)
-    except Exception as e:
-        logging.error(f"Não foi possível ler a pasta '{caminho}'. Erro: {str(e)}")
-        return f"Não foi possível ler a pasta. Erro: {str(e)}"
+        return f"Conteúdo do diretório: " + ", ".join(arquivos)
 
-def ler_arquivo(caminho_arquivo: str) -> str:
-    """
-    Lê e retorna o conteúdo de um arquivo local (.py, .json, .log, .md, .txt, etc)
-    para análise de código ou depuração de erros.
-    """
-    caminho_arquivo = caminho_arquivo.strip('\"').strip("\'")
-
-    if not os.path.isfile(caminho_arquivo):
-        logging.error(f"Erro: Arquivo não encontrado em '{caminho_arquivo}'.")
-        return f"Erro: Não foi possível encontrar o arquivo no caminho '{caminho_arquivo}'."
-
-    try:
-        with open(caminho_arquivo, 'r', encoding='utf-8') as arquivo:
-            conteudo = arquivo.read()
-
-            max_chars = int(os.getenv("MAX_FILE_READ_CHARS", str(DEFAULT_MAX_FILE_READ_CHARS)))
-            if len(conteudo) > max_chars:
-                logging.info(f"Arquivo '{caminho_arquivo}' muito grande, lendo os primeiros {max_chars} caracteres.")
-                return f"Arquivo muito grande. Aqui estão os primeiros {max_chars} caracteres:\n\n{conteudo[:max_chars]}"
-            logging.info(f"Arquivo '{caminho_arquivo}' lido com sucesso.")
-            return conteudo
-
-    except UnicodeDecodeError:
+    except FileNotFoundError:
+        return "Aviso: O diretório especificado não existe."
+    except PermissionError:
+        return "Aviso: Bloqueio de segurança. Não tenho permissão de leitura para esta pasta."
+    except OSError:
+        return "Aviso: Falha na leitura. O caminho pode estar mal formatado ou inacessível."
+def ler_arquivo(caminho_arquivo: str, inicio: int = 0, quantidade: int = 3000) -> str:
+    """Lê trecho de arquivo. inicio é o deslocamento em caracteres; use o próximo inicio para continuar."""
+    caminho_arquivo = caminho_arquivo.strip('"').strip("'")
+    teto = limite_env("MAX_FILE_READ_CHARS", DEFAULT_MAX_FILE_READ_CHARS, minimo=100, maximo=3000)
+    inicio = max(0, inicio)
+    quantidade = max(1, min(quantidade, teto))
+    for encoding in ('utf-8', 'latin-1'):
         try:
-            with open(caminho_arquivo, 'r', encoding='latin-1') as arquivo:
-                logging.info(f"Arquivo '{caminho_arquivo}' lido com encoding latin-1 após falha UTF-8.")
-                return arquivo.read()
-        except Exception as e:
-            logging.error(f"Falha na decodificação do arquivo '{caminho_arquivo}'. O arquivo pode não ser texto puro. Erro: {e}")
-            return f"Falha na decodificação. O arquivo pode não ser texto puro. Erro: {e}"
+            with open(caminho_arquivo, 'r', encoding=encoding) as arquivo:
+                restante = inicio
+                while restante:
+                    bloco = arquivo.read(min(restante, 8192))
+                    if not bloco:
+                        break
+                    restante -= len(bloco)
+                trecho = arquivo.read(quantidade)
+                mais = bool(arquivo.read(1))
+            cabecalho = f"Trecho a partir do caractere {inicio}. "
+            cabecalho += f"Próximo inicio: {inicio + len(trecho)}." if mais else "Fim do arquivo."
+            return cabecalho + "\n" + trecho
+        except UnicodeDecodeError:
+            continue
+        except OSError as e:
+            return f"Não foi possível ler o arquivo: {e}"
+    return "Não foi possível decodificar o arquivo."
 
-    except Exception as e:
-        logging.error(f"Erro inesperado ao tentar ler o arquivo '{caminho_arquivo}': {e}")
-        return f"Erro inesperado ao tentar ler o arquivo: {e}"
 
 def organizar_downloads(caminho: str = None) -> str:
     """
     Organiza automaticamente os arquivos da pasta Downloads do usuário,
-    movendo-os para subpastas categorizadas (Imagens, Documentos, Instaladores, Códigos, etc).
+    movendo-os para subpastas categorizadas.
     """
     import shutil
 
     if not caminho:
         caminho = os.path.join(os.path.expanduser('~'), 'Downloads')
-    
+    if _anti_rebote(f"org_downloads_{caminho}"):
+        logging.info(f"Organização da pasta '{caminho}' ignorada pelo anti-rebote.")
+        return "Ação ignorada: A faxina nesta pasta já foi iniciada ou concluída nos últimos instantes."
+
     if not os.path.exists(caminho):
         return f"A pasta '{caminho}' não existe ou está inacessível."
 
@@ -177,21 +191,21 @@ def organizar_downloads(caminho: str = None) -> str:
     try:
         for arquivo in os.listdir(caminho):
             caminho_arquivo = os.path.join(caminho, arquivo)
-            
+
             if os.path.isfile(caminho_arquivo):
                 _, extensao = os.path.splitext(arquivo)
                 extensao = extensao.lower()
-                
+
                 pasta_destino_nome = "Outros"
                 for categoria, extensoes in categorias.items():
                     if extensao in extensoes:
                         pasta_destino_nome = categoria
                         break
-                        
+
                 pasta_destino_caminho = os.path.join(caminho, pasta_destino_nome)
                 if not os.path.exists(pasta_destino_caminho):
                     os.makedirs(pasta_destino_caminho)
-                    
+
                 shutil.move(caminho_arquivo, os.path.join(pasta_destino_caminho, arquivo))
                 arquivos_movidos += 1
 
@@ -282,44 +296,47 @@ def buscar_resumo_wikipedia(termo: str) -> str:
         logging.error(f"Não foi possível encontrar informações diretas sobre '{termo}' na Wikipedia. Erro: {e}")
         return f"Não foi possível encontrar informações diretas sobre '{termo}' na Wikipedia."
 
+import concurrent.futures
+
+def _extrair_texto_url(url, headers, max_chars):
+    """Função auxiliar para baixar links em paralelo."""
+    try:
+        response = requests.get(url, headers=headers, timeout=8)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        conteudo_tags = soup.find_all(['p', 'pre', 'code', 'article', 'main', 'section', 'div'],
+                                       class_=['content', 'post-content', 'article-body', 'entry-content', 'main-content', 'text-content'])
+
+        texto_extraido = ""
+        for tag in conteudo_tags:
+            for script_or_style in tag(["script", "style"]):
+                script_or_style.decompose()
+            texto_extraido += tag.get_text(separator=' ', strip=True) + "\n"
+
+        logging.info(f"Conteúdo raspado da URL {url}.")
+        return f"--- Fonte: {url} ---\n{texto_extraido[:max_chars]}\n\n"
+    except Exception as e:
+        logging.error(f"Erro ao raspar a página {url}: {e}")
+        return f"Erro ao raspar a página {url}: {e}\n\n"
+
 def buscar_solucao_web(pergunta: str) -> str:
-    """
-    Pesquisa qualquer tipo de informação na internet (notícias, atualidades, dúvidas gerais ou erros de código),
-    acessa os primeiros resultados e retorna o conteúdo da página para a IA analisar e responder.
-    """
-    logging.info(f"JARVIS pesquisando na web por: {pergunta}")
+    """Pesquisa qualquer tipo de informação na internet de forma assíncrona."""
+    logging.info(f"Janus pesquisando na web por: {pergunta}")
     resultados_texto = f"Resultados da pesquisa para: {pergunta}\n\n"
 
     try:
         links = list(search(pergunta, num=3, stop=3, pause=2))
 
         if not links:
-            logging.info(f"Nenhum resultado encontrado no Google para '{pergunta}'.")
             return "Nenhum resultado encontrado no Google."
 
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-        
         max_scrape_chars = int(os.getenv("MAX_WEB_SCRAPE_CHARS_PER_PAGE", str(DEFAULT_MAX_WEB_SCRAPE_CHARS_PER_PAGE)))
 
-        for i, url in enumerate(links):
-            resultados_texto += f"--- Fonte {i+1}: {url} ---\n"
-            try:
-                response = requests.get(url, headers=headers, timeout=8)
-                soup = BeautifulSoup(response.text, 'html.parser')
-                conteudo_tags = soup.find_all(['p', 'pre', 'code', 'article', 'main', 'section', 'div'], 
-                                               class_=['content', 'post-content', 'article-body', 'entry-content', 'main-content', 'text-content'])
-            
-                texto_extraido = ""
-                for tag in conteudo_tags:
-                    for script_or_style in tag(["script", "style"]):
-                        script_or_style.decompose()
-                    texto_extraido += tag.get_text(separator=' ', strip=True) + "\n"
-
-                resultados_texto += texto_extraido[:max_scrape_chars] + "\n\n"
-                logging.info(f"Conteúdo raspado da URL {url}.")
-            except Exception as e:
-                logging.error(f"Erro ao raspar a página {url}: {e}")
-                resultados_texto += f"Erro ao raspar a página {url}: {e}\n\n"
+        # Otimização: Uso de Threads para requisições paralelas
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futuros = [executor.submit(_extrair_texto_url, url, headers, max_scrape_chars) for url in links]
+            for futuro in concurrent.futures.as_completed(futuros):
+                resultados_texto += futuro.result()
 
         return resultados_texto
 
@@ -399,74 +416,81 @@ def verificar_arquivos_suspeitos(caminho: str) -> str:
 # Ferramentas de execução de programas e controle de áudio/mídia.
 # =================================================================
 
+_CACHE_ATALHOS = {}
+_REGISTRO_EXECUCOES = {}
+
+def _anti_rebote(id_comando: str, cooldown_segundos: int = 15) -> bool:
+    """Bloqueia a execução de um mesmo comando crítico em um curto intervalo de tempo."""
+    agora = time.time()
+    if id_comando in _REGISTRO_EXECUCOES:
+        if (agora - _REGISTRO_EXECUCOES[id_comando]) < cooldown_segundos:
+            return True
+
+    _REGISTRO_EXECUCOES[id_comando] = agora
+    return False
+
 def abrir_aplicativo(nome_app: str) -> str:
-    """Busca dinamicamente e abre um aplicativo instalado no computador varrendo o Menu Iniciar."""
+    """Busca dinamicamente e abre um aplicativo utilizando cache em memória."""
+    global _CACHE_ATALHOS
     nome_busca = nome_app.lower().strip()
 
-    pastas_iniciar = [
-        os.path.join(os.environ.get('PROGRAMDATA', 'C:\\ProgramData'), r'Microsoft\Windows\Start Menu\Programs'),
-        os.path.join(os.environ.get('APPDATA'), r'Microsoft\Windows\Start Menu\Programs')
-    ]
-
     apps_nativos = {
-        'calculadora': 'calc',
-        'bloco de notas': 'notepad',
-        'paint': 'mspaint',
-        'prompt de comando': 'cmd',
-        'terminal': 'wt',
-        'powershell': 'powershell',
-        'painel de controle': 'control',
-        'configurações': 'ms-settings:',
-        'vscode': 'code',
-        'excel': 'excel',
-        'word': 'winword',
-        'powerpoint': 'powerpnt',
-        'chrome': 'chrome',
-        'firefox': 'firefox',
-        'edge': 'msedge',
-        'spotify': 'spotify',
-        'vlc': 'vlc',
-        'explorador de arquivos': 'explorer'
+        'calculadora': 'calc', 'bloco de notas': 'notepad', 'paint': 'mspaint',
+        'prompt de comando': 'cmd', 'terminal': 'wt', 'powershell': 'powershell',
+        'painel de controle': 'control', 'configurações': 'ms-settings:',
+        'vscode': 'code', 'excel': 'excel', 'word': 'winword', 'powerpoint': 'powerpnt',
+        'chrome': 'chrome', 'firefox': 'firefox', 'edge': 'msedge',
+        'spotify': 'spotify', 'vlc': 'vlc', 'explorador de arquivos': 'explorer'
     }
 
     if nome_busca in apps_nativos:
         try:
             subprocess.run(f"start {apps_nativos[nome_busca]}", shell=True, check=True)
-            logging.info(f"Aplicativo de sistema '{nome_busca}' acionado via subprocess.")
             return f"Aplicativo de sistema '{nome_busca}' acionado."
         except subprocess.CalledProcessError as e:
-            logging.error(f"Erro ao iniciar aplicativo nativo '{nome_busca}': {e}")
             return f"Erro ao iniciar aplicativo nativo: {e}"
 
-    for pasta in pastas_iniciar:
-        if not os.path.exists(pasta):
-            continue
+    # Otimização: Varre o disco apenas se o cache estiver vazio
+    if not _CACHE_ATALHOS:
+        logging.info("Construindo cache de atalhos do sistema na RAM...")
+        pastas_iniciar = [
+            os.path.join(os.environ.get('PROGRAMDATA', 'C:\\ProgramData'), r'Microsoft\Windows\Start Menu\Programs'),
+            os.path.join(os.environ.get('APPDATA', ''), r'Microsoft\Windows\Start Menu\Programs')
+        ]
 
-        for raiz, _, arquivos in os.walk(pasta):
-            for arquivo in arquivos:
-                if arquivo.lower().endswith(('.lnk', '.exe')):
-                    nome_atalho_ou_exe = os.path.splitext(arquivo)[0].lower()
+        for pasta in pastas_iniciar:
+            if not os.path.exists(pasta):
+                continue
+            for raiz, _, arquivos in os.walk(pasta):
+                for arquivo in arquivos:
+                    if arquivo.lower().endswith(('.lnk', '.exe')):
+                        nome_atalho = os.path.splitext(arquivo)[0].lower()
+                        _CACHE_ATALHOS[nome_atalho] = os.path.join(raiz, arquivo)
 
-                    if nome_busca in nome_atalho_ou_exe or nome_atalho_ou_exe in nome_busca:
-                        caminho_completo = os.path.join(raiz, arquivo)
-                        try:
-                            subprocess.run(f"start \"\" \"{caminho_completo}\"", shell=True, check=True)
-                            logging.info(f"Aplicativo '{os.path.splitext(arquivo)[0]}' localizado e aberto via subprocess.")
-                            return f"Aplicativo '{os.path.splitext(arquivo)[0]}' localizado e aberto com sucesso."
-                        except subprocess.CalledProcessError as e:
-                            logging.error(f"Encontrei o atalho/executável, mas houve bloqueio ao abrir '{os.path.splitext(arquivo)[0]}': {e}")
-                            return f"Encontrei o atalho/executável, mas houve bloqueio: {e}"
+    # Consulta no dicionário (RAM) em vez do HD
+    caminho_completo = None
+    nome_encontrado = None
 
+    for nome_atalho, caminho in _CACHE_ATALHOS.items():
+        if nome_busca in nome_atalho or nome_atalho in nome_busca:
+            caminho_completo = caminho
+            nome_encontrado = nome_atalho
+            break
+
+    if caminho_completo:
+        try:
+            subprocess.run(f"start \"\" \"{caminho_completo}\"", shell=True, check=True)
+            logging.info(f"Aplicativo '{nome_encontrado}' aberto via cache.")
+            return f"Aplicativo '{nome_encontrado}' localizado e aberto com sucesso."
+        except subprocess.CalledProcessError as e:
+            return f"Encontrei o atalho/executável, mas houve bloqueio: {e}"
+
+    # Fallback original
     try:
         subprocess.run(f"start {nome_busca}", shell=True, check=True)
-        logging.info(f"Enviada a requisição de '{nome_busca}' direto para o sistema via subprocess.")
-        return f"Enviada a requisição de '{nome_busca}' direto para o sistema. Verifique a tela."
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Não consegui localizar nenhum software chamado '{nome_app}'. Erro: {e}")
-        return f"Não consegui localizar nenhum software chamado '{nome_app}'. Por favor, verifique o nome ou caminho."
+        return f"Enviada a requisição de '{nome_busca}' direto para o sistema."
     except Exception as e:
-        logging.error(f"Erro inesperado ao tentar abrir o aplicativo '{nome_app}': {e}")
-        return f"Erro inesperado ao tentar abrir o aplicativo: {e}"
+        return f"Não consegui localizar nenhum software chamado '{nome_app}'. Erro: {e}"
 
 def tocar_musica(pesquisa: str, plataforma: str = 'spotify') -> str:
     """Busca e prepara para tocar uma música, artista ou playlist no Spotify ou YouTube."""
@@ -513,7 +537,7 @@ def controlar_midia(acao: str) -> str:
 
 def orquestrar_ambiente(cenario: str) -> str:
     """
-    Prepara o ambiente de trabalho abrindo os programas, terminais e sites necessários 
+    Prepara o ambiente de trabalho abrindo os programas, terminais e sites necessários
     para um cenário específico (ex: 'expediente', 'nuvem', 'encerrar').
     """
     cenario = cenario.lower()
@@ -530,14 +554,14 @@ def orquestrar_ambiente(cenario: str) -> str:
         os.system("start cmd.exe /k echo [Ambiente AWS CLI Pronto]")
         logging.info("Modo Escola da Nuvem ativado.")
         return "Modo Escola da Nuvem ativado. Console da AWS e terminal prontos."
-        
+
     elif "limpar" in cenario or "encerrar" in cenario or "fim" in cenario:
         processos_a_encerrar = ['code.exe', 'node.exe', 'python.exe', 'npm.exe', 'git.exe']
         for proc_name in processos_a_encerrar:
             os.system(f"taskkill /F /IM {proc_name} /T >nul 2>&1")
         logging.info("Ambiente limpo. Processos de desenvolvimento encerrados.")
         return "Ambiente limpo. Processos de desenvolvimento e relacionados encerrados."
-        
+
     else:
         logging.warning(f"Cenário '{cenario}' não reconhecido.")
         return f"Cenário '{cenario}' não reconhecido. Opções: Expediente, Nuvem ou Encerrar."
@@ -548,9 +572,15 @@ def orquestrar_ambiente(cenario: str) -> str:
 # =================================================================
 
 def executar_comando_terminal(comando: str) -> str:
+    """Executa um comando no terminal com proteção anti-rebote."""
+
+    # NOVA LINHA: Evita que o fallback do Gemini rode o mesmo comando 2x seguidas
+    if _anti_rebote(f"cmd_{comando}"):
+        logging.info(f"Comando '{comando}' ignorado pelo anti-rebote (duplicata de fallback).")
+        return "Comando ignorado para evitar execução duplicada pelo sistema de contingência."
     """
     Executa um comando diretamente no terminal/prompt do sistema operacional.
-    O JARVIS pode usar isso para instalar pacotes (pip install), verificar processos,
+    O Janus pode usar isso para instalar pacotes (pip install), verificar processos,
     ou rodar scripts. Requer aprovação manual do usuário antes de rodar.
 
     Args:
@@ -560,7 +590,7 @@ def executar_comando_terminal(comando: str) -> str:
     print("\n" + "!" * 50)
     print(" ALERTA DE SEGURANÇA: AVALIAÇÃO DE COMANDO ".center(50, " "))
     print("!" * 50)
-    print(f"O JARVIS elaborou um plano e deseja rodar o seguinte comando:\n\n>  {comando}\n")
+    print(f"O Janus elaborou um plano e deseja rodar o seguinte comando:\n\n>  {comando}\n")
 
     confirmacao = input("Permitir a execução? (S/N): ").strip().lower()
 
@@ -604,32 +634,49 @@ def executar_comando_terminal(comando: str) -> str:
 # =================================================================
 
 def ler_memorias_recentes(quantidade: int = 5) -> str:
-    """
-    Acessa o banco de dados vetorial e lista as últimas lembranças (memórias) armazenadas do usuário.
-    Acione esta ferramenta SEMPRE que o usuário perguntar "o que você lembra", "quais suas memórias" ou 
-    pedir para listar o histórico recente.
-    """
-    import chromadb
-    import os
-    import logging
+    """Audita a base de dados vetorial usando a conexão já ativa na RAM."""
+    global colecao_memoria_global
+
+    if not colecao_memoria_global:
+        return "O banco de dados de memória ainda não foi inicializado pelo sistema principal."
 
     try:
-        DB_PATH = os.getenv("JARVIS_DB_PATH", "./memoria_jarvis_db")
-        
-        if not os.path.exists(DB_PATH):
-            return "O banco de dados de memória ainda não foi criado no disco local."
-        chroma_client = chromadb.PersistentClient(path=DB_PATH)
-        colecao_memoria = chroma_client.get_collection(name="historico_conversas")
-        dados = colecao_memoria.get(limit=quantidade)
-        
+        dados = colecao_memoria_global.get(limit=quantidade)
+
         if not dados or not dados.get('documents'):
             return "Minha memória está vazia no momento."
-        resposta = f"Aqui estão as {quantidade} memórias (interações) extraídas diretamente do banco de dados vetorial:\n\n"
+
+        resposta = f"Aqui estão as {quantidade} memórias extraídas da sessão ativa:\n\n"
         for i, doc in enumerate(dados['documents']):
-            resposta += f"Registro {i+1}: {doc}\n"          
-        logging.info(f"O JARVIS auditou e listou as {quantidade} memórias mais recentes.")
+            resposta += f"Registro {i+1}: {doc}\n"
+        logging.info(f"O Janus auditou e listou as {quantidade} memórias mais recentes.")
         return resposta
-        
+
     except Exception as e:
         logging.error(f"Falha na ferramenta de leitura de memória vetorial: {e}")
-        return f"Tentei acessar o banco de memórias, mas ocorreu um erro técnico na leitura: {e}"
+        return f"Tentei acessar o banco de memórias, mas ocorreu um erro técnico: {e}"
+# Registro explícito: auxiliares como _anti_rebote e _extrair_texto_url
+# não devem ser enviadas ao modelo como ferramentas executáveis.
+FERRAMENTAS_JANUS = (
+    verificar_uso_sistema,
+    listar_processos_pesados,
+    matar_processo,
+    abrir_site,
+    abrir_pasta,
+    listar_arquivos_pasta,
+    ler_arquivo,
+    organizar_downloads,
+    listar_janelas_abertas,
+    gerenciar_janela,
+    pesquisar_no_google,
+    buscar_resumo_wikipedia,
+    buscar_solucao_web,
+    verificar_clima,
+    verificar_arquivos_suspeitos,
+    abrir_aplicativo,
+    tocar_musica,
+    controlar_midia,
+    orquestrar_ambiente,
+    executar_comando_terminal,
+    ler_memorias_recentes,
+)
